@@ -2,37 +2,96 @@ import socket
 import threading
 import itertools
 import sys
+import time
 
 # ----------------------------------------------------
 # 1. Configuration
 # ----------------------------------------------------
-# The list of backend servers (the "upstreams")
-BACKEND_SERVERS = [
-    ('127.0.0.1', 8081),
-    ('127.0.0.1', 8082),
+# The list of backend servers (the "upstreams") with their state
+SERVER_STATE = [
+    {'host': '127.0.0.1', 'port' : 8081, 'healthy': True, 'name': "Server 1"},
+    {'host': '127.0.0.1', 'port' : 8082, 'healthy': True, 'name': "Server 2"},
 ]
 
 LISTEN_PORT = 8000
 
-# The Round Robin iterator
-# cycle() makes an iterator that repeats the list indefinitely
-server_iterator = itertools.cycle(BACKEND_SERVERS)
+# The Round Robin index (simple counter)
+RR_INDEX = 0
 
-# Lock for thread-safe access to the server_iterator
-RR_LOCK = threading.Lock()
+# Lock for thread-safe access to the RR_INDEX and SERVER_STATE
+STATE_LOCK = threading.Lock()
 
 def get_next_server():
-    """Retrieves the next backend server using the Round Robin algorithm."""
-    with RR_LOCK:
-        # Get the next server from the cyclic iterator
-        return next(server_iterator)
+    """Retrieves the next HEALTHY backend server using the Round Robin algorithm."""
+    global RR_INDEX
+
+    with STATE_LOCK:
+        start_index = RR_INDEX
+        num_servers = len(SERVER_STATE)
+
+        while True:
+            server = SERVER_STATE[RR_INDEX]
+            
+            # Move the index for the next request
+            RR_INDEX = (RR_INDEX + 1) % num_servers
+
+            if server['healthy']:
+                return (server['host'], server['port'])
+
+            # If we've circled back to the starting point, all servers are down
+            if RR_INDEX == start_index:
+                # Raise an exception to be caught in proxy_handler
+                raise Exception("No healthy servers available.")
+
+def health_checker():
+    """Periodically checks the health of all backend servers."""
+    while True:
+        time.sleep(5)
+
+        with STATE_LOCK:
+            for server in SERVER_STATE:
+                host = server['host']
+                port = server['port']
+                is_healthy = False
+
+                try:
+                    probe_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    probe_sock.settimeout(1)
+                    probe_sock.connect((host, port))
+                    probe_sock.close()
+
+                    is_healthy = True
+                except socket.error:
+                    is_healthy = False
+
+                # Update the server state
+                if server['healthy'] != is_healthy:
+                    server['healthy'] = is_healthy
+                    status = "UP" if is_healthy else "DOWN"
+                    print(f"\n[HEALTH CHECK ALERT] Server {server['name']} ({host}:{port}) is now {status}!")
+
 
 def proxy_handler(client_sock, client_addr):
-    """Handles an incoming client connection by proxying to a backend server."""
-    backend_host, backend_port = get_next_server()
-    print(f"[{client_addr[0]}:{client_addr[1]}] -> Routing to {backend_host}:{backend_port}")
+    """Handles an incoming client connection by proxying to a backend server or returning 503."""
+    
+    # 503 Service Unavailable HTTP Response
+    RESPONSE_BODY = b"Service Unavailable. No healthy backend servers.\n"
+    CONTENT_LENGTH = str(len(RESPONSE_BODY)).encode('utf-8')
+    
+    SERVICE_UNAVAILABLE_RESPONSE = (
+        b"HTTP/1.1 503 Service Unavailable\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"Connection: close\r\n" # Explicitly tell curl we are closing
+        b"Content-Length: " + CONTENT_LENGTH + b"\r\n"
+        b"\r\n"
+        + RESPONSE_BODY
+    )
 
     try:
+        # Try to get a healthy server
+        backend_host, backend_port = get_next_server()
+        print(f"[{client_addr[0]}:{client_addr[1]}] -> Routing to {backend_host}:{backend_port}")
+
         # 1. Connect to the selected backend server
         backend_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         backend_sock.connect((backend_host, backend_port))
@@ -48,26 +107,33 @@ def proxy_handler(client_sock, client_addr):
         backend_sock.sendall(request_data.encode('utf-8'))
 
         # 4. Receive the response from the backend server
-        response_data = b""
         while True:
             # We assume a fixed buffer size for simplicity. In a real scenario,
             # you'd need to parse headers for Content-Length or Chunked encoding.
             part = backend_sock.recv(4096)
             if not part:
                 break
-            response_data += part
 
             # 5. Forward the backend's response back to the client
-            client_sock.sendall(response_data)
+            client_sock.sendall(part)
 
-    except socket.error as e:
-        print(f"Socket error during proxy: {e}")
-        # A simple HTTP 503 response could be sent here instead of just closing
+    except Exception as e:
+        error_message = str(e)
+        if "No healthy servers available." in error_message:
+            print(f"[{client_addr[0]}:{client_addr[1]}] -> ERROR: All servers down. Returning 503.")
+            client_sock.sendall(SERVICE_UNAVAILABLE_RESPONSE)
+        else:
+            print(f"[{client_addr[0]}:{client_addr[1]}] -> Socket error or other failure: {e}")
+            client_sock.sendall(SERVICE_UNAVAILABLE_RESPONSE) # Still return 503 on unexpected error
     finally:
         # 6. Close the connection
-        client_sock.close()
-        backend_sock.close()
-        print(f"[{client_addr[0]}:{client_addr[1]}] -> Connection closed.")
+        try:
+            client_sock.close()
+            if 'backend_sock' in locals() and backend_sock:
+                backend_sock.close()
+            print(f"[{client_addr[0]}:{client_addr[1]}] -> Connection closed.")
+        except Exception as e:
+            pass
 
 def start_load_balancer():
     """Starts the load balancer listener."""
@@ -80,7 +146,13 @@ def start_load_balancer():
     try:
         lb_socket.bind(('', LISTEN_PORT))
         lb_socket.listen(5)
-        print(f"Load Balancer running on port {LISTEN_PORT}. Backends: {BACKEND_SERVERS}")
+        print(f"Load Balancer running on port {LISTEN_PORT}. Backends: {len(SERVER_STATE)} defined.")
+
+        # --- Start the Health Check Thread ---
+        health_thread = threading.Thread(target=health_checker, daemon=True)
+        health_thread.start()
+        print("Health check thread started.")
+        # -------------------------------------
 
         while True:
             # Accept an incoming client connection
