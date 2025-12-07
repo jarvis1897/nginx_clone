@@ -1,7 +1,6 @@
 import socket
-import threading
+import asyncio
 import itertools
-import sys
 import time
 
 # ----------------------------------------------------
@@ -15,64 +14,61 @@ SERVER_STATE = [
 
 LISTEN_PORT = 8000
 
-# The Round Robin index (simple counter)
+# Global index and lock
 RR_INDEX = 0
+STATE_LOCK = asyncio.Lock()
 
-# Lock for thread-safe access to the RR_INDEX and SERVER_STATE
-STATE_LOCK = threading.Lock()
-
-def get_next_server():
+async def get_next_server():
     """Retrieves the next HEALTHY backend server using the Round Robin algorithm."""
     global RR_INDEX
-
-    with STATE_LOCK:
+    
+    # Use the async lock to ensure only one coroutine modifies RR_INDEX and checks state
+    async with STATE_LOCK: 
         start_index = RR_INDEX
         num_servers = len(SERVER_STATE)
-
+        
         while True:
             server = SERVER_STATE[RR_INDEX]
             
-            # Move the index for the next request
+            # Move the index for the next request attempt
             RR_INDEX = (RR_INDEX + 1) % num_servers
-
+            
             if server['healthy']:
                 return (server['host'], server['port'])
-
-            # If we've circled back to the starting point, all servers are down
+            
+            # If we've checked every server and came back to the start, all are down
             if RR_INDEX == start_index:
-                # Raise an exception to be caught in proxy_handler
                 raise Exception("No healthy servers available.")
 
-def health_checker():
+async def health_checker_async():
     """Periodically checks the health of all backend servers."""
     while True:
-        time.sleep(5)
+        await asyncio.sleep(5) # Wait asynchronously for 5 seconds
 
-        with STATE_LOCK:
+        # Acquire lock before modifying the shared state
+        async with STATE_LOCK:
             for server in SERVER_STATE:
                 host = server['host']
                 port = server['port']
                 is_healthy = False
-
+                
                 try:
                     probe_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     probe_sock.settimeout(1)
                     probe_sock.connect((host, port))
                     probe_sock.close()
-
                     is_healthy = True
                 except socket.error:
                     is_healthy = False
-
+                
                 # Update the server state
                 if server['healthy'] != is_healthy:
                     server['healthy'] = is_healthy
                     status = "UP" if is_healthy else "DOWN"
                     print(f"\n[HEALTH CHECK ALERT] Server {server['name']} ({host}:{port}) is now {status}!")
-
-
-def proxy_handler(client_sock, client_addr):
-    """Handles an incoming client connection by proxying to a backend server or returning 503."""
+    
+async def async_proxy_handler(client_reader, client_writer):
+    """Handles an incoming client connection asynchronously."""
     
     # 503 Service Unavailable HTTP Response
     RESPONSE_BODY = b"Service Unavailable. No healthy backend servers.\n"
@@ -87,94 +83,86 @@ def proxy_handler(client_sock, client_addr):
         + RESPONSE_BODY
     )
 
+    client_addr = client_writer.get_extra_info('peername')
+    print(f"Incoming connection from {client_addr[0]}:{client_addr[1]}")
+
     try:
-        # Try to get a healthy server
-        backend_host, backend_port = get_next_server()
-        print(f"[{client_addr[0]}:{client_addr[1]}] -> Routing to {backend_host}:{backend_port}")
-
-        # 1. Connect to the selected backend server
-        backend_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        backend_sock.connect((backend_host, backend_port))
-
-        # 2. Receive the request from the client (the initial HTTP request line)
-        request_data = client_sock.recv(4096).decode('utf-8')
+        # 1. Get request data from client
+        request_data = await client_reader.read(4096)
         if not request_data:
             return
+        
+        # 2. Select a healthy backend server
+        backend_host, backend_port = await get_next_server()
+        print(f"[{client_addr[0]}:{client_addr[1]}] -> Routing to {backend_host}:{backend_port}")
 
-        request_data = request_data.replace('Connection: keep-alive', 'Connection: close')
+        # 3. Connect to the selected backend server asynchronously
+        backend_reader, backend_writer = await asyncio.open_connection(backend_host, backend_port)
 
-        # 3. Forward the client's request to the backend server
-        backend_sock.sendall(request_data.encode('utf-8'))
+        # 4. Modify and forward the request
+        request_str = request_data.decode('utf-8').replace('Connection: keep-alive', 'Connection: close')
+        backend_writer.write(request_str.encode('utf-8'))
+        await backend_writer.drain() # Ensure the data is written immediately
 
-        # 4. Receive the response from the backend server
+        # 5. Shunt response data from backend to client
         while True:
-            # We assume a fixed buffer size for simplicity. In a real scenario,
-            # you'd need to parse headers for Content-Length or Chunked encoding.
-            part = backend_sock.recv(4096)
+            # Asynchronously read chunks from the backend
+            part = await backend_reader.read(4096)
             if not part:
                 break
 
-            # 5. Forward the backend's response back to the client
-            client_sock.sendall(part)
+            # Asynchronously write chunks to the client
+            client_writer.write(part)
+            await client_writer.drain() # Ensure the data is sent immediately
 
     except Exception as e:
         error_message = str(e)
-        if "No healthy servers available." in error_message:
+        if "No healthy servers available." in error_message or "Connection refused" in error_message:
             print(f"[{client_addr[0]}:{client_addr[1]}] -> ERROR: All servers down. Returning 503.")
-            client_sock.sendall(SERVICE_UNAVAILABLE_RESPONSE)
+            client_writer.write(SERVICE_UNAVAILABLE_RESPONSE)
         else:
-            print(f"[{client_addr[0]}:{client_addr[1]}] -> Socket error or other failure: {e}")
-            client_sock.sendall(SERVICE_UNAVAILABLE_RESPONSE) # Still return 503 on unexpected error
+            print(f"[{client_addr[0]}:{client_addr[1]}] -> Async error: {e}")
+            client_writer.write(SERVICE_UNAVAILABLE_RESPONSE)
+
     finally:
         # 6. Close the connection
-        try:
-            client_sock.close()
-            if 'backend_sock' in locals() and backend_sock:
-                backend_sock.close()
-            print(f"[{client_addr[0]}:{client_addr[1]}] -> Connection closed.")
-        except Exception as e:
-            pass
+        client_writer.close()
+        await client_writer.wait_closed()
+        if 'backend_writer' in locals():
+            backend_writer.close()
+            await backend_writer.wait_closed()
+        print(f"[{client_addr[0]}:{client_addr[1]}] -> Connection closed.")
+        
 
-def start_load_balancer():
-    """Starts the load balancer listener."""
-    # Create the load balancer socket
-    lb_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+async def start_load_balancer_async():
+    """Starts the load balancer listener and the health checker tasks."""
 
-    # Allow the socket to be reused immediately after closing
-    lb_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # 1. Start the health check as a background task
+    health_task = asyncio.create_task(health_checker_async())
+    print("Health check task started.")
+    
+    # 2. Start the main listener server
+    server = await asyncio.start_server(
+        async_proxy_handler, 
+        '0.0.0.0', # Listen on all interfaces
+        LISTEN_PORT
+    )
 
+    addr = server.sockets[0].getsockname()
+    print(f"Async Load Balancer running on port {addr[1]}. Backends: {len(SERVER_STATE)} defined.")
+
+    # 3. Run forever
+    async with server:
+        await server.serve_forever()
+
+if __name__ == '__main__':
     try:
-        lb_socket.bind(('', LISTEN_PORT))
-        lb_socket.listen(5)
-        print(f"Load Balancer running on port {LISTEN_PORT}. Backends: {len(SERVER_STATE)} defined.")
-
-        # --- Start the Health Check Thread ---
-        health_thread = threading.Thread(target=health_checker, daemon=True)
-        health_thread.start()
-        print("Health check thread started.")
-        # -------------------------------------
-
-        while True:
-            # Accept an incoming client connection
-            client_sock, client_addr = lb_socket.accept()
-            print(f"Incoming connection from {client_addr[0]}:{client_addr[1]}")
-
-            # Start a new thread to handle the proxying for this client
-            thread = threading.Thread(
-                target=proxy_handler,
-                args=(client_sock, client_addr)
-            )
-            thread.start()
-
+        asyncio.run(start_load_balancer_async())
     except KeyboardInterrupt:
         print("\nStopping Load Balancer...")
     except Exception as e:
         print(f"An error occurred: {e}")
-    finally:
-        lb_socket.close()
-        sys.exit(0)
 
-if __name__ == '__main__':
-    start_load_balancer()
+
 
 
